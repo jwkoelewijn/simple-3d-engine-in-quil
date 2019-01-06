@@ -142,7 +142,7 @@
              (* vy m31)
              (* vz m32)
              (* vw m33))]
-      [x y z w]))
+    [x y z w]))
 
 
 (defn- row-times-column [[r0 r1 r2 r3] [c0 c1 c2 c3]]
@@ -203,6 +203,72 @@
 
 (defn normalize-vector [v]
   (vector-scale v (/ 1.0 (vector-length v))))
+
+(defn vector-intersect-plane [point-in-plane plane-normal line-start line-end]
+  (let [plane-normal (normalize-vector plane-normal)
+        plane-dot-product (* -1.0 (dot-product plane-normal point-in-plane))
+        ad (dot-product line-start plane-normal)
+        bd (dot-product line-end plane-normal)
+        t (/ (- (* -1.0 plane-dot-product) ad)
+             (- bd ad))
+        line-start-to-end (vector-subtract line-end line-start)
+        line-to-intersect (vector-mul line-start-to-end t)]
+    (vector-add line-start line-to-intersect)))
+
+(comment
+  (vector-intersect-plane (vector 10 0 0) (vector 1 0 0) (vector -10 0 0) (vector 10 0 0)))
+
+
+(defn clip-against-plane
+  "Clip a triangle against a plane given by a point in that plane and the normal of the plane,
+   returns a vector of either 0, 1 or 2 triangles."
+  [point-in-plane, plane-normal, {:keys [vertices] :as triangle}]
+  (let [[nx ny nz :as plane-normal] (normalize-vector plane-normal)
+        plane-intersect (partial vector-intersect-plane point-in-plane plane-normal)
+        dist (fn [[x y z :as point]]
+               (let [res (- (+ (* nx x)
+                               (* ny y)
+                               (* nz z))
+                            (dot-product plane-normal point-in-plane))]
+                 ;(println "distance from" point "to" plane-normal "=" res)
+                 res))
+        {:keys [inside-points outside-points]} (reduce (fn [res point]
+                                                         (let [d (dist point)]
+                                                           (if (>= d 0)
+                                                             (update res :inside-points (fnil conj []) point)
+                                                             (update res :outside-points (fnil conj []) point))))
+                                                       {} vertices)
+        inside-count (count inside-points)
+        outside-count (count outside-points)]
+    (cond
+      (= 0 inside-count) (do ;(println "all out")
+                           [])
+      (= 3 inside-count) [triangle]
+      (and (= 1 inside-count)
+           (= 2 outside-count)) (do
+                                  ;(if (= plane-normal (vector -1.0 0.0 0.0))
+                                   ; (println "testing " triangle " against right sizes, 2 out")
+                                  [(-> triangle
+                                    (assoc :color [0 0 255])
+                                    (assoc :vertices [(first inside-points)
+                                                      (plane-intersect (first inside-points) (first outside-points))
+                                                      (plane-intersect (first inside-points) (second outside-points))]))])
+      (and (= 2 inside-count)
+           (= 1 outside-count)) (do
+                                        ;(println "1 out")
+                                        (let [new-triangle-1 (-> triangle
+                                                                 (assoc :color [255 0 0])
+                                                                 (assoc :vertices [(first inside-points)
+                                                                                   (second inside-points)
+                                                                                   (plane-intersect (first inside-points) (first outside-points))]))
+
+                                              new-triangle-2 (-> triangle
+                                                                 (assoc :color [0 255 0])
+                                                                 (assoc :vertices [(second inside-points)
+                                                                                   (last (:vertices new-triangle-1))
+                                                                                   (plane-intersect (second inside-points) (first outside-points))]))]
+                                          [new-triangle-1 new-triangle-2])))))
+
 
 (defn point-at-matrix [pos target up]
   (let [new-forward (normalize-vector (vector-subtract target pos))
@@ -301,7 +367,7 @@
                              (multiply-matrix rot-x)
                              (multiply-matrix translation)
                              (multiply-matrix view-matrix))]
-        ;_ (clojure.pprint/pprint transform-matrix)]
+    ;_ (clojure.pprint/pprint transform-matrix)]
     (map #(apply-transformation % transform-matrix))))
 
 (def calculate-normals-transducer
@@ -314,20 +380,56 @@
 (defn shading-transducer [light-direction]
   (map #(shade-triangle % light-direction)))
 
+
 (def print-transducer
   (map #(do (println %)
             %)))
 
-(defn pipeline [{:keys [t camera light-direction look-direction yaw] :as _state}]
+(defn clip-to-near-plane-reducer [res triangle]
+  (apply conj res (clip-against-plane (vector 0.0 0.0 near) (vector 0.0 0.0 1.0) triangle)))
+
+(defn process-planes [n [t & rest :as tris] [[point normal :as plane] & other-planes :as planes]]
+  ;(println "called with" tris)
+  (if (empty? planes)
+    (do
+
+      tris)
+    (let [new-tris (clip-against-plane point normal t)
+          tris (apply conj rest new-tris)]
+      (if (> n 0)
+        (recur (dec n) tris other-planes)
+        (recur (count new-tris) tris other-planes)))))
+
+(comment
+  (clip-against-plane (vector 490.0 0.0 0.0) (vector -1.0 0.0 0.0) {:vertices [[512.0 384.0 0.9875987598759876] [482.36625805838935 354.36625805838935 0.9875987598759876] [482.36625805838935 384.0 0.9875987598759876]], :color [200.0 200.0 200.0], :visible? true, :normal [0.0 0.0 -1.0 1.0]}))
+
+(def screen-planes
+  [[(vector 0.0 0.0 0.0) (vector 0.0 1.0 0.0)]
+   [(vector 0.0 (double (dec screen-height)) 0.0) (vector 0.0 -1.0 0.0)]
+   [(vector 0.0 0.0 0.0) (vector 1.0 0.0 0.0)]
+   [(vector (double (dec screen-width)) 0.0 0.0) (vector -1.0 0.0 0.0)]])
+
+(defn clip-to-view-reducer [res {:keys [vertices] :as triangle}]
+  ;(if (> (ffirst vertices) 500)
+  ;  (println "Should be clipped: " triangle))
+  (let [processed (process-planes 1 (list triangle) screen-planes)]
+    ;(println processed)
+    (apply conj res processed)))
+
+(defn modification-pipeline [{:keys [t camera light-direction look-direction yaw] :as _state}]
   (comp
     (modify-mesh-transducer 0.0 8.0 camera look-direction yaw)
     calculate-normals-transducer
     ;print-transducer
     (culling-transducer camera)
-    (shading-transducer light-direction)
-    ;print-transducer
-    project-transducer
-    scale-to-view-transducer))
+    (shading-transducer light-direction)))
+;print-transducer
+;project-transducer
+;scale-to-view-transducer))
+
+(def projection-pipeline
+  (comp project-transducer
+        scale-to-view-transducer))
 
 
 (defn draw-triangle [x1 y1 x2 y2 x3 y3 color]
@@ -343,13 +445,18 @@
     (if (seq rest)
       (recur rest))))
 
-(defn update-state [{:keys [mesh yaw] :as state}]
+(defn current-t []
+  (System/currentTimeMillis))
+
+(defn update-state [{:keys [mesh yaw t last-t fps] :as state}]
   (let [look-direction (let [target-vector (vector 0.0 0.0 1.0)
                              camera-rotation-matrix (y-rotation-matrix yaw)
                              look-dir (vector-matrix-mult target-vector camera-rotation-matrix)]
                          (vector-div look-dir (last look-dir)))]
-    (-> state
-        (update :t inc)
+
+    (-> (assoc state :t (/ (- (current-t) (or last-t 0))
+                           (/ 100000 fps)))
+
         (assoc :look-direction look-direction)
         (assoc :to-render (sort-by
                             (fn [{:keys [vertices]}]
@@ -357,8 +464,12 @@
                                 ;; take the average z-value of each vertex
                                 (* -1.0 (/ (+ (nth v1 2) (nth v2 2) (nth v3 2))
                                            3.0))))
-                            (into [] (pipeline state)
-                                  mesh))))))
+                            (->> (into [] (modification-pipeline state)
+                                       mesh)
+                                 (reduce clip-to-near-plane-reducer [])
+                                 (into [] projection-pipeline)
+                                 (reduce clip-to-view-reducer []))))
+        (assoc :last-t (current-t)))))
 
 (defn draw-state [{:keys [to-render camera look-direction] :as _state}]
   ; Clear the sketch by filling it with black color.
@@ -368,24 +479,28 @@
   (q/fill 255 255 255)
   (draw-mesh to-render))
 
+
 (defn setup []
-  ; Set frame rate to 30 frames per second.
-  (q/frame-rate 60)
-  ; Set color mode to HSB (HSV) instead of default RGB.
-  (q/color-mode :rgb)
-  ; setup function returns initial state. It contains
-  ; circle color and position.
-  {:mesh            (load-mesh-from-file "resources/axis.obj");(load-mesh-from-file "resources/VideoShip.obj");(load-mesh-from-file "resources/teapot.obj");
-   :to-render       []
-   :camera          (vector 0.0 0.0 0.0)
-   :yaw             0.0
-   :look-direction  (vector 0.0 0.0 1.0)
-   :light-direction (vector 0.0 1.0 -1.0)
-   :t               0})
+  (let [fps 60]
+    ; Set frame rate to 30 frames per second.
+    (q/frame-rate fps)
+    ; Set color mode to HSB (HSV) instead of default RGB.
+    (q/color-mode :rgb)
+    ; setup function returns initial state. It contains
+    ; circle color and position.
+    {:mesh            (load-mesh-from-file "resources/axis.obj") ;(load-mesh-from-file "resources/VideoShip.obj");(load-mesh-from-file "resources/teapot.obj");
+     :to-render       []
+     :camera          (vector 0.0 0.0 0.0)
+     :yaw             0.0
+     :look-direction  (vector 0.0 0.0 1.0)
+     :light-direction (vector 0.0 1.0 -1.0)
+     :last-t          0
+     :t               0
+     :fps      fps}))
 
 (defn handle-key-press [{:keys [look-direction t] :as state} {:keys [key] :as _event}]
-  (let [t (/ t 15000)
-        forward-vector (vector-mul look-direction (* 8.0 t))]
+  (let [;t (/ t 1000)
+        forward-vector (vector-mul look-direction (* 5.0 t))]
     (condp = key
       :up (update state :camera (fn [[x y z]] [x
                                                (+ y (* 8.0 t))
