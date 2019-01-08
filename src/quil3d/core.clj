@@ -367,7 +367,6 @@
                              (multiply-matrix rot-x)
                              (multiply-matrix translation)
                              (multiply-matrix view-matrix))]
-    ;_ (clojure.pprint/pprint transform-matrix)]
     (map #(apply-transformation % transform-matrix))))
 
 (def calculate-normals-transducer
@@ -418,7 +417,7 @@
 
 (defn modification-pipeline [{:keys [t camera light-direction look-direction yaw] :as _state}]
   (comp
-    (modify-mesh-transducer 0.0 8.0 camera look-direction yaw)
+    (modify-mesh-transducer 0 8.0 camera look-direction yaw)
     calculate-normals-transducer
     ;print-transducer
     (culling-transducer camera)
